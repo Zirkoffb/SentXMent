@@ -1,0 +1,670 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8" />
+<meta
+name="viewport"
+content="width=device-width,initial-scale=1.0,maximum-scale=1.0,minimum-scale=1.0"
+/>
+<title>Lightweight Charts™ Customization Tutorial</title>
+<!-- Adding the standalone version of Lightweight charts -->
+<script
+type="text/javascript"
+src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"
+></script>
+<style>
+body {
+padding: 0;
+margin: 0;
+/* Add a background color to match the chart */
+background-color: #222;
+}
+</style>
+</head>
+
+<body>
+<div
+id="container"
+style="position: absolute; width: 100%; height: 100%"
+></div>
+<script type="text/javascript">
+    // src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"
+
+    // NOVA FUNÇÃO ADICIONADA AQUI
+    async function fetchBinanceKlines(symbol, interval, limit = 500) {
+        // Constrói a URL para a API da Binance Klines
+        const url = `https://api.binance.com/api/v3/klines?symbol=${symbol.toUpperCase()}&interval=${interval}&limit=${limit}`;
+        try {
+            const response = await fetch(url);
+            if (!response.ok) {
+                // Se a resposta não for OK, lança um erro com o status
+                throw new Error(`Erro na requisição à API da Binance: ${response.statusText} (${response.status})`);
+            }
+            const rawData = await response.json();
+            // Mapeia os dados brutos para o formato esperado pela Lightweight Charts
+            // kline[0] = Open time (timestamp em milissegundos)
+            // kline[1] = Open price
+            // kline[2] = High price
+            // kline[3] = Low price
+            // kline[4] = Close price
+            // kline[5] = Volume
+            // kline[6] = Close time (timestamp em milissegundos) -> Usaremos este para 'time' para garantir que o candle está fechado
+            const formattedData = rawData.map(kline => {
+                const openPrice = parseFloat(kline[1]);
+                const closePrice = parseFloat(kline[4]);
+                const volumeValue = parseFloat(kline[5]); // Volume está no índice 5
+                
+                let barColor;
+                if (closePrice >= openPrice) {
+                    barColor = 'rgba(0, 150, 136, 0.7)'; // Verde para alta (cor customizável)
+                } else {
+                    barColor = 'rgba(255, 82, 82, 0.7)'; // Vermelho para baixa (cor customizável)
+                }
+
+                return {
+                    time: kline[6] / 1000,       // Tempo de fechamento em segundos
+                    open: openPrice,
+                    high: parseFloat(kline[2]),
+                    low: parseFloat(kline[3]),
+                    close: closePrice,
+                    volume: volumeValue,         // Adicionar o valor do volume
+                    volumeColor: barColor        // Adicionar a cor para a barra de volume
+                };
+            });
+            return formattedData;
+        } catch (error) {
+            console.error('Falha ao buscar ou formatar dados da Binance:', error);
+            // Em caso de erro, exibe no console e retorna um array vazio para evitar que o gráfico quebre
+            const errorDiv = document.createElement('div');
+            errorDiv.style.color = 'red';
+            errorDiv.style.padding = '10px';
+            errorDiv.textContent = `Erro ao carregar dados de ${symbol}: ${error.message}. Verifique o console para mais detalhes e se o símbolo é válido na Binance.`;
+            document.body.insertBefore(errorDiv, document.getElementById('container'));
+            return []; 
+        }
+    }
+
+    function calculateBollingerBands(data, period = 20, stdDevMultiplier = 2) {
+        if (!data || data.length < period) {
+            return { sma: [], upper: [], lower: [] };
+        }
+
+        const smaValues = [];
+        const upperBand = [];
+        const lowerBand = [];
+
+        for (let i = period - 1; i < data.length; i++) {
+            const slice = data.slice(i - period + 1, i + 1);
+            const sum = slice.reduce((acc, val) => acc + val.close, 0);
+            const mean = sum / period;
+
+            const variance = slice.reduce((acc, val) => acc + Math.pow(val.close - mean, 2), 0) / period;
+            const stdDev = Math.sqrt(variance);
+
+            smaValues.push({ time: data[i].time, value: mean });
+            upperBand.push({ time: data[i].time, value: mean + stdDev * stdDevMultiplier });
+            lowerBand.push({ time: data[i].time, value: mean - stdDev * stdDevMultiplier });
+        }
+        return { sma: smaValues, upper: upperBand, lower: lowerBand };
+    }
+
+    function calculateEMA(data, period) {
+        if (!data || data.length < period) {
+            return [];
+        }
+        const emaValues = [];
+        const k = 2 / (period + 1); // Fator de suavização
+        // Primeiro valor da EMA é uma SMA simples
+        let sum = 0;
+        for (let i = 0; i < period; i++) {
+            sum += data[i].close;
+        }
+        let prevEma = sum / period;
+        emaValues.push({ time: data[period - 1].time, value: prevEma });
+
+        // Calcular EMAs subsequentes
+        for (let i = period; i < data.length; i++) {
+            const currentEma = (data[i].close - prevEma) * k + prevEma;
+            emaValues.push({ time: data[i].time, value: currentEma });
+            prevEma = currentEma;
+        }
+        return emaValues;
+    }
+
+    function calculateMACD(data, shortPeriod = 12, longPeriod = 26, signalPeriod = 9) {
+        if (!data || data.length < longPeriod) {
+            return { macdLine: [], signalLine: [], histogram: [] };
+        }
+
+        const emaShort = calculateEMA(data, shortPeriod);
+        const emaLong = calculateEMA(data, longPeriod);
+
+        const macdLine = [];
+        const signalLine = [];
+        const histogram = [];
+
+        // Alinhar os dados de EMA. EMAs começam em momentos diferentes.
+        // Precisamos encontrar o ponto de partida comum.
+        let shortIdx = 0;
+        let longIdx = 0;
+        const alignedMacdValues = [];
+
+        while(shortIdx < emaShort.length && longIdx < emaLong.length) {
+            if (emaShort[shortIdx].time < emaLong[longIdx].time) {
+                shortIdx++;
+            } else if (emaLong[longIdx].time < emaShort[shortIdx].time) {
+                longIdx++;
+            } else { // Tempos são iguais
+                const macdValue = emaShort[shortIdx].value - emaLong[longIdx].value;
+                alignedMacdValues.push({ time: emaShort[shortIdx].time, value: macdValue });
+                macdLine.push({ time: emaShort[shortIdx].time, value: macdValue });
+                shortIdx++;
+                longIdx++;
+            }
+        }
+        
+        if (alignedMacdValues.length < signalPeriod) {
+             // Não há dados suficientes para a linha de sinal ou histograma
+             return { macdLine: macdLine, signalLine: [], histogram: [] };
+        }
+
+        // Calcular Linha de Sinal (EMA da Linha MACD)
+        // A `calculateEMA` espera objetos com uma propriedade 'close', então adaptamos
+        const macdForSignalCalc = alignedMacdValues.map(item => ({ time: item.time, close: item.value }));
+        const calculatedSignalLine = calculateEMA(macdForSignalCalc, signalPeriod);
+        
+        // Alinhar linha de sinal com a linha MACD
+        let macdIdx = 0;
+        let sigIdx = 0;
+        while(macdIdx < macdLine.length && sigIdx < calculatedSignalLine.length) {
+             if(macdLine[macdIdx].time < calculatedSignalLine[sigIdx].time) {
+                 macdIdx++;
+             } else if (calculatedSignalLine[sigIdx].time < macdLine[macdIdx].time) {
+                 sigIdx++;
+             } else {
+                 signalLine.push({time: macdLine[macdIdx].time, value: calculatedSignalLine[sigIdx].value});
+                
+                 // Calcular Histograma
+                 const histValue = macdLine[macdIdx].value - calculatedSignalLine[sigIdx].value;
+                 histogram.push({ time: macdLine[macdIdx].time, value: histValue });
+                 macdIdx++;
+                 sigIdx++;
+             }
+        }
+        
+        return { macdLine, signalLine, histogram };
+    }
+
+    function calculateStochasticOscillator(data, kPeriod = 14, dPeriod = 3, smoothK = 3) {
+        if (!data || data.length < kPeriod) {
+            return { kLine: [], dLine: [] };
+        }
+
+        const kValues = [];
+        const dValues = [];
+
+        // Calcular %K
+        for (let i = kPeriod - 1; i < data.length; i++) {
+            const slice = data.slice(i - kPeriod + 1, i + 1);
+            const lowestLow = Math.min(...slice.map(d => d.low));
+            const highestHigh = Math.max(...slice.map(d => d.high));
+            const currentClose = data[i].close;
+
+            let percentK = 0;
+            if (highestHigh - lowestLow > 0) { // Evitar divisão por zero
+                percentK = ((currentClose - lowestLow) / (highestHigh - lowestLow)) * 100;
+            }
+            kValues.push({ time: data[i].time, value: percentK });
+        }
+
+        if (kValues.length < smoothK) return { kLine: kValues, dLine: [] };
+
+        // Suavizar %K (geralmente uma SMA de %K)
+        const smoothedKValues = [];
+        for (let i = smoothK - 1; i < kValues.length; i++) {
+            const kSlice = kValues.slice(i - smoothK + 1, i + 1);
+            const sumK = kSlice.reduce((acc, val) => acc + val.value, 0);
+            smoothedKValues.push({ time: kValues[i].time, value: sumK / smoothK });
+        }
+        
+        if (smoothedKValues.length < dPeriod) return { kLine: smoothedKValues, dLine: [] };
+
+        // Calcular %D (SMA de %K suavizado)
+        for (let i = dPeriod - 1; i < smoothedKValues.length; i++) {
+            const dSlice = smoothedKValues.slice(i - dPeriod + 1, i + 1);
+            const sumD = dSlice.reduce((acc, val) => acc + val.value, 0);
+            dValues.push({ time: smoothedKValues[i].time, value: sumD / dPeriod });
+        }
+
+        return { kLine: smoothedKValues, dLine: dValues };
+    }
+
+    function calculateATR(data, period = 14) {
+        if (!data || data.length < 1) { // Precisa de pelo menos 1 barra para o primeiro TR
+            return [];
+        }
+
+        const trueRanges = [];
+        // Calcular o primeiro True Range
+        trueRanges.push(data[0].high - data[0].low); // Para a primeira barra, TR = High - Low
+
+        for (let i = 1; i < data.length; i++) {
+            const high = data[i].high;
+            const low = data[i].low;
+            const prevClose = data[i-1].close;
+            const tr = Math.max(high - low, Math.abs(high - prevClose), Math.abs(low - prevClose));
+            trueRanges.push(tr);
+        }
+
+        if (trueRanges.length < period) {
+             // Não há dados suficientes para calcular o ATR completo
+             // Poderia retornar TRs brutos se desejado, mas ATR requer período completo
+             return [];
+        }
+        
+        const atrValues = [];
+        // Primeiro ATR é a média simples dos primeiros 'period' True Ranges
+        let sumTR = 0;
+        for (let i = 0; i < period; i++) {
+            sumTR += trueRanges[i];
+        }
+        let prevATR = sumTR / period;
+        atrValues.push({ time: data[period -1].time, value: prevATR }); // Associa ao tempo do último dado usado no primeiro cálculo
+
+        // Calcular ATRs subsequentes usando a fórmula de suavização (RMA/SMMA/Wilder's MA)
+        for (let i = period; i < trueRanges.length; i++) {
+            // O tempo do dado original correspondente a trueRanges[i] é data[i].time
+            const currentATR = (prevATR * (period - 1) + trueRanges[i]) / period;
+            atrValues.push({ time: data[i].time, value: currentATR });
+            prevATR = currentATR;
+        }
+        
+        return atrValues;
+    }
+
+    function calculateSMA(data, period) {
+        if (!data || data.length < period) {
+            return [];
+        }
+        const smaValues = [];
+        for (let i = period - 1; i < data.length; i++) {
+            const slice = data.slice(i - period + 1, i + 1);
+            const sum = slice.reduce((acc, val) => acc + val.close, 0);
+            const mean = sum / period;
+            smaValues.push({ time: data[i].time, value: mean });
+        }
+        return smaValues;
+    }
+
+    const chart = LightweightCharts.createChart(
+document.getElementById('container'),
+{
+layout: {
+background: { color: "#222" },
+textColor: "#C3BCDB",
+},
+grid: {
+vertLines: { color: "#444" },
+horzLines: { color: "#444" },
+},
+}
+);
+
+// Setting the border color for the vertical axis
+chart.priceScale().applyOptions({
+borderColor: "#71649C",
+});
+
+// Setting the border color for the horizontal axis
+chart.timeScale().applyOptions({
+borderColor: "#71649C",
+});
+
+// Adjust the starting bar width (essentially the horizontal zoom)
+chart.timeScale().applyOptions({
+barSpacing: 10,
+});
+
+// Get the current users primary locale
+const currentLocale = window.navigator.languages[0];
+// Create a number format using Intl.NumberFormat
+const myPriceFormatter = Intl.NumberFormat(currentLocale, {
+style: "currency",
+currency: "EUR", // Currency for data points
+}).format;
+
+// Apply the custom priceFormatter to the chart
+chart.applyOptions({
+localization: {
+priceFormatter: myPriceFormatter,
+},
+});
+
+// Customizing the Crosshair
+chart.applyOptions({
+crosshair: {
+// Change mode from default 'magnet' to 'normal'.
+// Allows the crosshair to move freely without snapping to datapoints
+mode: LightweightCharts.CrosshairMode.Normal,
+
+// Vertical crosshair line (showing Date in Label)
+vertLine: {
+width: 8,
+color: "#C3BCDB44",
+style: LightweightCharts.LineStyle.Solid,
+labelBackgroundColor: "#9B7DFF",
+},
+
+// Horizontal crosshair line (showing Price in Label)
+horzLine: {
+color: "#9B7DFF",
+labelBackgroundColor: "#9B7DFF",
+},
+},
+});
+
+// Create the Main Series (Candlesticks)
+const mainSeries = chart.addSeries(LightweightCharts.CandlestickSeries);
+
+// NOVA CHAMADA ASSÍNCRONA ADICIONADA AQUI
+(async () => {
+    const symbol = 'NEIROETHUSDT'; // Símbolo do ativo
+    const interval = '5m';        // Intervalo do gráfico
+    const limit = 200;
+
+    const candleStickData = await fetchBinanceKlines(symbol, interval, limit);
+
+    if (candleStickData && candleStickData.length > 0) {
+        // Calcular Bandas de Bollinger
+        const bollingerBandsData = calculateBollingerBands(candleStickData, 20, 2); // Periodo 20, 2 desvios padrão
+
+        // Adicionar séries para Bandas de Bollinger ANTES de definir os dados da mainSeries
+        // para garantir que as séries estejam na ordem correta de desenho (velas por cima)
+        
+        const bbSmaSeries = chart.addLineSeries({
+            color: 'rgba(0, 150, 255, 0.8)', // Azul claro/ciano
+            lineWidth: 1,
+            priceLineVisible: false, // Esconde a linha de preço no eixo para esta série
+            lastValueVisible: false, // Esconde o valor no eixo para esta série
+        });
+        bbSmaSeries.setData(bollingerBandsData.sma);
+
+        const bbUpperSeries = chart.addLineSeries({
+            color: 'rgba(0, 150, 255, 0.8)', // Azul claro/ciano
+            lineWidth: 1,
+            priceLineVisible: false,
+            lastValueVisible: false,
+        });
+        bbUpperSeries.setData(bollingerBandsData.upper);
+
+        const bbLowerSeries = chart.addLineSeries({
+            color: 'rgba(0, 150, 255, 0.8)', // Azul claro/ciano
+            lineWidth: 1,
+            priceLineVisible: false,
+            lastValueVisible: false,
+        });
+        bbLowerSeries.setData(bollingerBandsData.lower);
+
+        // Calcular e adicionar as duas Médias Móveis
+        const smaPeriodLong = 50; // Período para a SMA longa (roxa)
+        const smaPeriodShort = 9; // Período para a SMA curta (azul claro)
+
+        const smaDataLong = calculateSMA(candleStickData, smaPeriodLong);
+        const smaDataShort = calculateSMA(candleStickData, smaPeriodShort);
+
+        const smaSeriesLong = chart.addLineSeries({
+            color: 'rgba(128, 0, 128, 0.9)', // Roxo
+            lineWidth: 2, // Mais grossa
+            priceLineVisible: false,
+            lastValueVisible: false,
+        });
+        smaSeriesLong.setData(smaDataLong);
+
+        const smaSeriesShort = chart.addLineSeries({
+            color: 'rgba(0, 150, 255, 0.7)', // Azul claro (mesma cor das bandas de Bollinger, mas mais fina)
+            lineWidth: 1, // Mais fina
+            priceLineVisible: false,
+            lastValueVisible: false,
+        });
+        smaSeriesShort.setData(smaDataShort);
+
+        // Calcular e adicionar MACD
+        const macdData = calculateMACD(candleStickData); // Usa períodos padrão 12, 26, 9
+
+        // Criar uma nova escala de preço para o MACD no lado direito
+        // Dando um ID único para a nova escala de preço
+        const macdPriceScaleId = 'macd_price_scale';
+        chart.applyOptions({
+            // Ajustar a escala de preço principal (esquerda) para dar espaço
+            priceScale: {
+                // A escala de preço padrão já existe (geralmente à direita por padrão)
+                // Se quisermos a principal à esquerda e MACD à direita, precisamos configurar a principal primeiro.
+                // Por enquanto, vamos adicionar a nova escala à direita e ver como fica.
+            },
+            // Definir a altura relativa para a nova escala (simulando um painel)
+            // Estes valores são experimentais e podem precisar de ajuste.
+            // A propriedade 'height' para priceScales não é padrão.
+            // Em vez disso, controlamos a altura do painel do indicador pela altura da série.
+            // A Lightweight Charts não tem um conceito de "painel" explícito como TradingView.
+            // Uma forma de simular é criar um novo gráfico ou usar price scales e ajustar a altura visualmente.
+            // Para este passo, vamos focar em adicionar as séries a uma nova escala.
+            // A separação visual em "painéis" pode ser refinada depois.
+        });
+        
+        // Linha MACD (Roxa, fina e reativa)
+        const macdLineSeries = chart.addLineSeries({
+            color: 'rgba(192, 75, 192, 0.9)', // Roxo (ajustado para ser um pouco diferente do SMA roxo)
+            lineWidth: 1, // Fina
+            priceScaleId: macdPriceScaleId, // Associar à nova escala de preço
+            // Opções para não poluir a escala:
+            priceLineVisible: false,
+            lastValueVisible: true, // Mostrar o último valor na escala do MACD
+            title: 'MACD', // Título que pode aparecer em legendas, etc.
+        });
+        macdLineSeries.setData(macdData.macdLine);
+
+        // Linha de Sinal (Amarela, grossa e suave)
+        const macdSignalSeries = chart.addLineSeries({
+            color: 'rgba(255, 215, 0, 0.9)', // Amarelo (Dourado para melhor visibilidade)
+            lineWidth: 2, // Grossa
+            priceScaleId: macdPriceScaleId, // Associar à nova escala de preço
+            priceLineVisible: false,
+            lastValueVisible: true,
+            title: 'Signal',
+        });
+        macdSignalSeries.setData(macdData.signalLine);
+        
+        // Configurar a nova escala de preço MACD
+        // A escala de preço é criada implicitamente quando uma série é associada a um priceScaleId que não existe.
+        // Agora podemos aplicar opções a ela.
+         chart.priceScale(macdPriceScaleId).applyOptions({
+             // A altura da escala não é diretamente configurável por 'height'.
+             // A altura do "painel" do indicador é mais influenciada pela altura da própria série
+             // e pelo espaçamento que o gráfico principal permite.
+             // Definimos uma altura máxima percentual para esta escala em relação ao container do gráfico.
+             // Isso é um pouco de "hack", pois a Lightweight Charts não tem painéis fixos.
+             // A propriedade 'scaleMargins' pode ajudar a criar espaço, mas não define altura de painel.
+             // A documentação sugere que, para painéis separados, múltiplos gráficos são a melhor abordagem.
+             // Por enquanto, vamos ver como fica com as séries em uma nova escala.
+             // A escala de 10, 0, -10 será automática baseada nos dados do MACD.
+             // Para forçar a escala, precisaríamos de `autoScale: false` e definir `min` e `max` manualmente,
+             // o que não é ideal para indicadores dinâmicos.
+         });
+
+        // Calcular e adicionar Oscilador Estocástico
+        const stochasticData = calculateStochasticOscillator(candleStickData); // Usa períodos padrão 14, 3, 3
+
+        const stochasticPriceScaleId = 'stochastic_price_scale';
+
+        // Linha %K (Azul Claro, fina) - Principal do Estocástico
+        const stochasticKLineSeries = chart.addLineSeries({
+            color: 'rgba(135, 206, 250, 0.9)', // Azul Claro (SkyBlue)
+            lineWidth: 1, // Fina
+            priceScaleId: stochasticPriceScaleId,
+            priceLineVisible: false,
+            lastValueVisible: true,
+            title: '%K',
+        });
+        stochasticKLineSeries.setData(stochasticData.kLine);
+
+        // Linha %D (Amarela, grossa) - Média de %K (Sinal)
+        const stochasticDLineSeries = chart.addLineSeries({
+            color: 'rgba(255, 215, 0, 0.9)', // Amarelo (Dourado, igual à linha de sinal do MACD)
+            lineWidth: 2, // Grossa
+            priceScaleId: stochasticPriceScaleId,
+            priceLineVisible: false,
+            lastValueVisible: true,
+            title: '%D',
+        });
+        stochasticDLineSeries.setData(stochasticData.dLine);
+
+        // Configurar a nova escala de preço para o Estocástico
+        // e adicionar as linhas de nível 20 e 80
+        chart.priceScale(stochasticPriceScaleId).applyOptions({
+            // A escala será de 0 a 100 para o Estocástico.
+            // Forçar min/max para garantir que 0-100 seja sempre visível.
+            autoScale: false, // Desabilitar autoScale para definir min/max manualmente
+            min: -5,          // Um pouco abaixo de 0 para margem
+            max: 105,         // Um pouco acima de 100 para margem
+        });
+        
+        // Adicionar linhas de preço para os níveis 20 e 80 na escala do Estocástico
+        // Linha de nível 80 (Sobrecompra)
+        stochasticKLineSeries.createPriceLine({
+            price: 80.0,
+            color: 'rgba(200, 200, 200, 0.4)', // Cinza claro, semi-transparente
+            lineWidth: 1,
+            lineStyle: LightweightCharts.LineStyle.Dashed,
+            axisLabelVisible: true,
+            title: '80',
+        });
+
+        // Linha de nível 20 (Sobrevenda)
+        stochasticKLineSeries.createPriceLine({
+            price: 20.0,
+            color: 'rgba(200, 200, 200, 0.4)', // Cinza claro, semi-transparente
+            lineWidth: 1,
+            lineStyle: LightweightCharts.LineStyle.Dashed,
+            axisLabelVisible: true,
+            title: '20',
+        });
+        
+        // A "Zona Sombreada" entre 20 e 80 é difícil de fazer diretamente.
+        // As PriceLines acima marcam os níveis. Para um sombreamento real,
+        // precisaríamos de abordagens mais complexas (ex: múltiplas AreaSeries ou custom renderers)
+        // que estão fora do escopo desta etapa inicial.
+
+        // Calcular e adicionar ATR (Average True Range)
+        const atrData = calculateATR(candleStickData); // Usa período padrão 14
+
+        const atrPriceScaleId = 'atr_price_scale';
+
+        // Linha ATR (Azul)
+        const atrLineSeries = chart.addLineSeries({
+            color: 'rgba(0, 100, 255, 0.9)', // Azul (um pouco diferente do azul claro das SMAs/Estocástico)
+            lineWidth: 1,
+            priceScaleId: atrPriceScaleId,
+            priceLineVisible: false,
+            lastValueVisible: true,
+            title: 'ATR',
+        });
+        atrLineSeries.setData(atrData);
+
+        // Configurar a nova escala de preço para o ATR
+        chart.priceScale(atrPriceScaleId).applyOptions({
+            // A escala do ATR é geralmente pequena e positiva.
+            // Deixar autoScale true por enquanto para ver os valores reais.
+            // A escala 0, 0.5, 1.0 mencionada no briefing é muito específica
+            // e pode não se adequar bem aos valores reais do ATR sem normalização.
+            autoScale: true, 
+        });
+
+        // Preparar dados para a série de Volume
+        const volumeData = candleStickData.map(d => ({
+            time: d.time,
+            value: d.volume,
+            color: d.volumeColor, // Cor definida em fetchBinanceKlines
+        }));
+
+        const volumePriceScaleId = 'volume_price_scale';
+
+        // Adicionar Série de Histograma para o Volume
+        const volumeSeries = chart.addHistogramSeries({
+            priceScaleId: volumePriceScaleId,
+            priceLineVisible: false,
+            lastValueVisible: true,
+            title: 'Volume',
+            // Não definir `color` aqui, pois será por barra
+        });
+        volumeSeries.setData(volumeData);
+        
+        // Configurar a escala de preço para o Volume
+        chart.priceScale(volumePriceScaleId).applyOptions({
+            autoScale: true,
+            // A altura desta escala/painel pode ser melhor controlada ajustando
+            // as scaleMargins da escala de preço principal do gráfico para criar espaço.
+            // Por exemplo, aumentar o 'bottom' margin da escala de preço principal.
+            // Para um controle mais direto da altura do painel de volume,
+            // a opção `height` não é padrão para priceScale.
+            // A documentação sugere que a altura de um painel de indicador (histograma)
+            // é influenciada pela opção `pane` na série, mas isso é para múltiplos painéis NO MESMO eixo.
+            // Com priceScaleId diferentes, eles já são painéis separados.
+            // Vamos ajustar as margens da escala principal mais tarde se necessário para dar altura.
+            scaleMargins: { // Margens para a própria escala de volume
+                top: 0.85, // 85% do painel de volume estará vazio no topo (volume fica na base)
+                bottom: 0,
+            },
+        });
+        
+        // Ajustar a escala de preço principal para dar espaço para o painel de volume
+        // Esta é uma forma de controlar a altura relativa dos "painéis"
+        chart.priceScale().applyOptions({ // Acessa a escala de preço padrão (principal)
+            scaleMargins: {
+                top: 0.05, // Margem no topo do gráfico principal
+                bottom: 0.3, // Aumentar esta margem para dar mais espaço para os painéis inferiores (MACD, Stoch, ATR, Volume)
+                            // Este valor (0.3) significa que 30% da altura total será para os painéis inferiores.
+                            // Pode precisar de ajuste.
+            }
+        });
+        // Se você tiver outras escalas de preço (MACD, Stoch, ATR) e quiser controlar suas alturas relativas
+        // de forma mais granular, seria necessário ajustar suas `scaleMargins.top` e `scaleMargins.bottom`
+        // ou usar a técnica de criar gráficos separados para cada painel.
+        // Por enquanto, o `bottom` da escala principal é o controle mais direto.
+
+        
+        // Definir dados para a série principal (velas)
+        mainSeries.setData(candleStickData.map(d => ({ time: d.time, open: d.open, high: d.high, low: d.low, close: d.close })));
+
+    } else {
+        console.log('Nenhum dado de vela foi carregado para o gráfico.');
+    }
+})();
+
+// Configurações existentes da mainSeries (cores, etc.)
+mainSeries.applyOptions({
+    wickUpColor: 'rgb(255, 255, 0)',    // Amarelo Brilhante
+    upColor: 'rgb(255, 255, 0)',        // Amarelo Brilhante
+    wickDownColor: 'rgb(128, 0, 128)',  // Roxo
+    downColor: 'rgb(128, 0, 128)',      // Roxo
+    borderVisible: false,               // Manter como está
+});
+
+// Adjust the options for the priceScale of the mainSeries
+mainSeries.priceScale().applyOptions({
+autoScale: true, // MUDADO para true para melhor visualização inicial
+scaleMargins: {
+top: 0.1,
+bottom: 0.2,
+},
+});
+
+// Adding a window resize event handler to resize the chart when
+// the window size changes.
+// Note: for more advanced examples (when the chart doesn't fill the entire window)
+// you may need to use ResizeObserver -> https://developer.mozilla.org/en-US/docs/Web/API/ResizeObserver
+window.addEventListener("resize", () => {
+chart.resize(window.innerWidth, window.innerHeight);
+});
+</script>
+</body>
+</html>
